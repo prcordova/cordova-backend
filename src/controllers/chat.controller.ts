@@ -413,10 +413,9 @@ const searchDictionaries = async (term: string, lang: string): Promise<Dictionar
 
 const generateResponse = async (message: string): Promise<LLMResponse> => {
   try {
-    // 1. Verifica se é expressão matemática
+    // 1. Verifica cálculos
     const mathPattern = /(\d+\s*[\+\-\*\/]\s*\d+)/;
     const mathMatch = message.match(mathPattern);
-    
     if (mathMatch) {
       const expression = mathMatch[1];
       const cleanExpr = expression.replace(/\s+/g, '');
@@ -436,59 +435,98 @@ const generateResponse = async (message: string): Promise<LLMResponse> => {
     // 2. Verifica se é comando de aprendizado
     if (message.toLowerCase().startsWith('aprenda')) {
       const content = message
-        .replace(/^aprenda\s*["'](.*)["'].*$/i, '$1')
+        .replace(/^aprenda\s*["']?(.*)["']?.*$/i, '$1')
         .trim();
 
-      // Analisa o conteúdo para determinar o tipo
-      const contentType = analyzeContentType(content);
-      const term = extractTerm(content, contentType);
-
-      if (!term) {
-        return {
-          content: 'Não consegui identificar o termo. Pode ser mais específico?',
-          confidence: 0
-        };
+      // Analisa o conteúdo para extrair relacionamentos
+      const relationships = extractRelationships(content);
+      
+      // Salva cada conceito e suas relações
+      for (const item of relationships) {
+        await Knowledge.create({
+          content: item.content,
+          term: item.term,
+          relatedTerms: item.related,
+          type: item.type,
+          category: item.category,
+          source: 'user_teaching',
+          language: 'pt',
+          timestamp: new Date()
+        });
       }
 
-      // Salva o conhecimento de forma dinâmica
-      await Knowledge.create({
-        content,
-        type: contentType.type,
-        category: contentType.category,
-        source: 'user_teaching',
-        path: `${contentType.category}/${contentType.type}`,
-        language: 'pt',
-        term: term.toLowerCase(),
-        confidence: 1,
-        timestamp: new Date()
-      });
-
       return {
-        content: `Obrigado! Aprendi sobre ${term} na categoria ${contentType.category}.`,
+        content: 'Obrigado! Aprendi esses conceitos e suas relações.',
         confidence: 1
       };
     }
 
-    // 3. Busca normal
+    // 3. Busca conhecimento
     const searchTerm = message.toLowerCase()
       .replace(/[?.,!]/g, '')
       .replace(/o que é|what is|que es|como usar|how to use/g, '')
       .trim();
 
-    // 4. Busca dinâmica pelo termo
-    const knowledge = await Knowledge.findOne({
-      term: searchTerm
-    }).sort({ timestamp: -1 });
+    console.log('🔍 Buscando conhecimento para:', searchTerm);
 
-    if (knowledge) {
+    const knowledge = await Knowledge.aggregate([
+      {
+        $match: {
+          $or: [
+            { term: searchTerm },
+            { relatedTerms: searchTerm }
+          ]
+        }
+      },
+      {
+        $lookup: {
+          from: 'knowledge',
+          localField: 'relatedTerms',
+          foreignField: 'term',
+          as: 'related'
+        }
+      },
+      {
+        $sort: { timestamp: -1 }
+      },
+      {
+        $limit: 1
+      }
+    ]);
+
+    if (knowledge && knowledge.length > 0) {
+      const mainConcept = knowledge[0];
+      
+      // Só inclui conceitos relacionados se existirem
+      let response = mainConcept.content;
+      
+      if (mainConcept.related && mainConcept.related.length > 0) {
+        const relevantRelated = mainConcept.related
+          .filter(r => r.content && r.term !== searchTerm)
+          .map(r => `- ${r.term}: ${r.content.split('.')[0]}`);
+
+        if (relevantRelated.length > 0) {
+          response += '\n\nConceitos relacionados:\n' + relevantRelated.join('\n');
+        }
+      }
+
       return {
-        content: formatResponse(knowledge),
-        confidence: knowledge.confidence || 0.8
+        content: response,
+        confidence: mainConcept.confidence || 0.8
+      };
+    }
+
+    // 4. Se não encontrou, verifica se é um comando ou pergunta comum
+    const commonCommands = ['fale', 'diga', 'mostre', 'explique'];
+    if (commonCommands.includes(searchTerm)) {
+      return {
+        content: 'Como posso ajudar? Você pode me perguntar sobre conceitos específicos ou me ensinar novos conceitos.',
+        confidence: 0.5
       };
     }
 
     return {
-      content: `Não encontrei uma definição para "${searchTerm}". Você pode me ensinar usando 'aprenda "definição"'`,
+      content: `Não encontrei informações sobre "${searchTerm}". Você pode me ensinar usando o comando 'aprenda' seguido da definição.`,
       confidence: 0
     };
 
@@ -499,6 +537,26 @@ const generateResponse = async (message: string): Promise<LLMResponse> => {
       confidence: 0
     };
   }
+};
+
+const extractRelationships = (content: string) => {
+  const concepts = [];
+  const words = content.toLowerCase().split(/\s+/);
+  
+  // Extrai conceitos e suas relações
+  for (let i = 0; i < words.length; i++) {
+    if (words[i].match(/<\w+>/) || words[i].match(/\b(tag|html|element)\b/)) {
+      concepts.push({
+        term: words[i].replace(/[<>]/g, ''),
+        content: content,
+        related: ['html', 'tag', 'element'],
+        type: 'concept',
+        category: 'web'
+      });
+    }
+  }
+
+  return concepts;
 };
 
 const analyzeContentType = (content: string) => {
