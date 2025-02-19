@@ -70,29 +70,55 @@ const learnFromMessage = async (message: string) => {
 
 const generateResponse = async (message: string, knowledge: any[]) => {
   const msgLower = message.toLowerCase().trim();
+  console.log('📝 Mensagem recebida:', message);
 
-  // Saudações
-  if (msgLower.match(/^(oi|olá|hey|hi|hello)$/)) {
-    return baseKnowledge.greetings[Math.floor(Math.random() * baseKnowledge.greetings.length)];
-  }
-
-  // Se está ensinando (contém =)
-  if (message.includes('=')) {
-    const learned = await learnFromMessage(message);
-    return learned ? 
-      "Obrigado por me ensinar! Agora sei a resposta." : 
-      "Desculpe, não entendi bem essa expressão.";
-  }
+  // Busca mais específica baseada em palavras-chave
+  const searchTerms = msgLower.split(' ').filter(term => term.length > 2);
   
-  // Se está perguntando
-  const answer = await findKnowledge(message);
-  if (answer) {
-    return answer;
-  }
+  const query = {
+    $or: [
+      { content: { $regex: searchTerms.join('|'), $options: 'i' } },
+      { content: { $regex: message, $options: 'i' } }
+    ]
+  };
 
-  // Se não encontrou resposta
-  if (message.match(/\d+\s*[\+\-\*x\/]\s*\d+/)) {
-    return "Desculpe, ainda não sei essa resposta. Você pode me ensinar?";
+  const results = await Knowledge.find(query)
+    .sort({ _id: -1 })
+    .limit(5);
+
+  if (results.length > 0) {
+    // Tenta encontrar a resposta mais relevante
+    let bestMatch = results[0].content;
+    
+    // Se perguntou sobre estrutura HTML
+    if (msgLower.includes('estrutura') && msgLower.includes('html')) {
+      const htmlStructure = `A estrutura básica do HTML é:
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Título da página</title>
+</head>
+<body>
+    Conteúdo da página
+</body>
+</html>`;
+      
+      return htmlStructure;
+    }
+
+    // Remove URLs e conteúdo irrelevante
+    bestMatch = bestMatch.replace(/https?:\/\/[^\s]+/g, '')
+                        .replace(/[^\w\s<>\/="'{}().,;:-]/g, ' ')
+                        .trim();
+
+    // Extrai um trecho relevante
+    const sentences = bestMatch.split(/[.!?]+/);
+    const relevantSentences = sentences.filter(sentence => 
+      searchTerms.some(term => sentence.toLowerCase().includes(term))
+    );
+
+    return relevantSentences.join('. ') || bestMatch;
   }
 
   return "Desculpe, ainda não tenho informações suficientes sobre isso. Você pode me ensinar compartilhando documentos ou links relevantes.";
