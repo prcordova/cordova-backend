@@ -120,27 +120,71 @@ const analyzeContent = async (message: string) => {
 };
 
 const learnFromMessage = async (message: string) => {
-  try {
-    // Analisa o conteúdo
-    const analysis = await analyzeContent(message);
-    
-    // Salva o conhecimento categorizado
-    await Knowledge.create({
-      content: message,
-      category: analysis.category,
-      tokens: analysis.tokens,
-      confidence: analysis.confidence,
-      timestamp: new Date(),
-      source: 'user_input'
-    });
+  // Padrões de aprendizado dinâmicos
+  const patterns = [
+    {
+      regex: /(\d+\s*[\+\-\*\/]\s*\d+)\s*=\s*(\d+)/,
+      type: 'math',
+      extract: (match: RegExpMatchArray) => ({
+        term: match[1].replace(/\s+/g, ''),
+        value: match[2],
+        category: 'calculation'
+      })
+    },
+    {
+      regex: /(?:o que é|significa|define-se como|é|são) (.+)/i,
+      type: 'definition',
+      extract: (match: RegExpMatchArray) => ({
+        term: match[1].trim(),
+        value: message,
+        category: 'concept'
+      })
+    },
+    {
+      regex: /a capital d[aeo] (.+) é (.+)/i,
+      type: 'location',
+      extract: (match: RegExpMatchArray) => ({
+        term: match[1].trim(),
+        value: match[2].trim(),
+        category: 'capital'
+      })
+    },
+    {
+      regex: /(?:o presidente|líder) d[aeo] (.+) é (.+)/i,
+      type: 'person',
+      extract: (match: RegExpMatchArray) => ({
+        term: match[1].trim(),
+        value: match[2].trim(),
+        category: 'leader'
+      })
+    }
+  ];
 
-    console.log(`📚 Aprendido: ${message} (${analysis.category})`);
-    return true;
-
-  } catch (error) {
-    console.error('❌ Erro ao aprender:', error);
-    return false;
+  for (const pattern of patterns) {
+    const match = message.match(pattern.regex);
+    if (match) {
+      const data = pattern.extract(match);
+      await Knowledge.create({
+        term: data.term,
+        content: data.value,
+        type: pattern.type,
+        category: data.category,
+        source: 'user_teaching',
+        timestamp: new Date()
+      });
+      return true;
+    }
   }
+
+  // Salva mensagem geral para contexto
+  await Knowledge.create({
+    content: message,
+    type: 'conversation',
+    source: 'user_input',
+    timestamp: new Date()
+  });
+  
+  return false;
 };
 
 const processContent = (content: string) => {
@@ -355,10 +399,9 @@ const generateResponse = async (message: string): Promise<LLMResponse> => {
   console.log('📝 Processando mensagem:', message);
 
   try {
-    // 1. Verifica se é expressão matemática
+    // 1. Verifica cálculos primeiro
     const mathPattern = /(\d+\s*[\+\-\*\/]\s*\d+)/;
     const mathMatch = message.match(mathPattern);
-
     if (mathMatch) {
       const expression = mathMatch[1];
       const cleanExpr = expression.replace(/\s+/g, '');
@@ -375,39 +418,32 @@ const generateResponse = async (message: string): Promise<LLMResponse> => {
       }
     }
 
-    // 2. Busca mais abrangente no banco
+    // 2. Busca ampla inicial
     const searchTerm = message.toLowerCase().trim();
-    const knowledge = await Knowledge.findOne({
-      $or: [
-        // Busca exata
-        { content: { $regex: new RegExp(`\\b${searchTerm}\\b`, 'i') } },
-        // Busca no início de frases
-        { content: { $regex: new RegExp(`^${searchTerm}\\b|\\. ${searchTerm}\\b`, 'i') } },
-        // Busca em definições
-        { content: { $regex: new RegExp(`${searchTerm}\\s+(?:is|are|é|são|significa|means)`, 'i') } },
-        // Busca em tags HTML
-        { content: { $regex: new RegExp(`<${searchTerm}[^>]*>|tag\\s+${searchTerm}`, 'i') } }
-      ]
-    }).sort({ 
-      // Prioriza conteúdo mais relevante
-      source: -1,
-      timestamp: -1 
-    });
+    const results = await Knowledge.find({
+      content: { $regex: searchTerm, $options: 'i' }
+    }).limit(10);
 
-    if (knowledge) {
-      // Extrai a parte mais relevante do conteúdo
-      const relevantContent = extractRelevantContent(knowledge.content, searchTerm);
-      
-      return {
-        content: relevantContent,
-        confidence: 0.8
-      };
+    // 3. Valida e remove redundâncias
+    const uniqueResults = removeDuplicateContent(results);
+
+    // 4. Analisa utilidade do conteúdo
+    const validatedResults = validateContentUtility(uniqueResults, searchTerm);
+
+    // 5. Se não encontrou nada útil, tenta busca alternativa
+    if (validatedResults.length === 0) {
+      console.log('🔄 Tentando busca alternativa...');
+      const alternativeResults = await Knowledge.find({
+        $or: [
+          { term: { $regex: searchTerm, $options: 'i' } },
+          { content: { $regex: `define.*${searchTerm}|${searchTerm}.*means`, $options: 'i' } }
+        ]
+      }).limit(5);
+
+      return processResults(alternativeResults, searchTerm);
     }
 
-    return {
-      content: `Não encontrei uma definição para "${message}". Você pode me ensinar?`,
-      confidence: 0
-    };
+    return processResults(validatedResults, searchTerm);
 
   } catch (error) {
     console.error('❌ Erro:', error);
@@ -418,21 +454,89 @@ const generateResponse = async (message: string): Promise<LLMResponse> => {
   }
 };
 
-const extractRelevantContent = (content: string, term: string): string => {
-  // Remove tags HTML
-  const cleanContent = content.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  
-  // Procura por sentenças contendo o termo
-  const sentences = cleanContent.split(/[.!?]+/);
-  const relevantSentences = sentences.filter(sentence => 
-    sentence.toLowerCase().includes(term.toLowerCase())
-  );
+const removeDuplicateContent = (results: any[]): any[] => {
+  const seen = new Set();
+  return results.filter(item => {
+    const cleanContent = item.content
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
+    
+    if (seen.has(cleanContent)) return false;
+    seen.add(cleanContent);
+    return true;
+  });
+};
 
-  if (relevantSentences.length > 0) {
-    return relevantSentences[0].trim();
+const validateContentUtility = (results: any[], term: string): any[] => {
+  return results.filter(item => {
+    const content = item.content.toLowerCase();
+    
+    // Critérios de utilidade
+    const hasDefinition = content.includes('is') || content.includes('means') || content.includes('defines');
+    const hasTechnicalContext = content.includes('tag') || content.includes('element') || content.includes('attribute');
+    const hasNoiseWords = content.includes('login') || content.includes('menu') || content.includes('javascript needs');
+    const isTooShort = content.length < 20;
+    const isTooLong = content.length > 500;
+
+    return (hasDefinition || hasTechnicalContext) && !hasNoiseWords && !isTooShort && !isTooLong;
+  });
+};
+
+const processResults = (results: any[], term: string): LLMResponse => {
+  if (results.length === 0) {
+    return {
+      content: `Não encontrei uma definição útil para "${term}". Você poderia me ensinar?`,
+      confidence: 0
+    };
   }
 
-  return cleanContent;
+  // Pega o melhor resultado
+  const bestResult = results[0];
+  const cleanContent = cleanAndExtractDefinition(bestResult.content, term);
+
+  if (cleanContent) {
+    return {
+      content: cleanContent,
+      confidence: 0.8
+    };
+  }
+
+  return {
+    content: `Encontrei informações sobre "${term}", mas não consegui extrair uma definição clara. Pode reformular a pergunta?`,
+    confidence: 0.3
+  };
+};
+
+const cleanAndExtractDefinition = (content: string, term: string): string => {
+  // Remove conteúdo indesejado
+  content = content
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
+    .replace(/<nav\b[^<]*(?:(?!<\/nav>)<[^<]*)*<\/nav>/gi, '')
+    .replace(/<header\b[^<]*(?:(?!<\/header>)<[^<]*)*<\/header>/gi, '')
+    .replace(/<footer\b[^<]*(?:(?!<\/footer>)<[^<]*)*<\/footer>/gi, '')
+    .replace(/JavaScript|precisa|ativar|Google Drive/gi, '')
+    .replace(/menu|login|copyright|navigation/gi, '');
+
+  // Procura pela definição mais relevante
+  const definitionPatterns = [
+    new RegExp(`<${term}[^>]*>.*?<\/${term}>.*?(?=\\.|$)`, 'i'),
+    new RegExp(`${term}\\s+(?:tag|element).*?(?=\\.|$)`, 'i'),
+    new RegExp(`(?:defines|specifies|is).*?${term}.*?(?=\\.|$)`, 'i')
+  ];
+
+  for (const pattern of definitionPatterns) {
+    const match = content.match(pattern);
+    if (match) {
+      return match[0]
+        .replace(/<[^>]*>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+  }
+
+  return '';
 };
 
 // Função para aprender de novas fontes
