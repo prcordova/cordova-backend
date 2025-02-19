@@ -413,7 +413,27 @@ const searchDictionaries = async (term: string, lang: string): Promise<Dictionar
 
 const generateResponse = async (message: string): Promise<LLMResponse> => {
   try {
-    // 1. Verifica se é um comando de aprendizado
+    // 1. Verifica se é expressão matemática
+    const mathPattern = /(\d+\s*[\+\-\*\/]\s*\d+)/;
+    const mathMatch = message.match(mathPattern);
+    
+    if (mathMatch) {
+      const expression = mathMatch[1];
+      const cleanExpr = expression.replace(/\s+/g, '');
+      try {
+        const result = eval(cleanExpr);
+        if (Number.isFinite(result)) {
+          return {
+            content: `${cleanExpr} = ${result}`,
+            confidence: 1
+          };
+        }
+      } catch (error) {
+        console.error('❌ Erro no cálculo:', error);
+      }
+    }
+
+    // 2. Verifica se é comando de aprendizado
     if (message.toLowerCase().startsWith('aprenda')) {
       const content = message
         .replace(/^aprenda\s*["'](.*)["'].*$/i, '$1')
@@ -449,19 +469,18 @@ const generateResponse = async (message: string): Promise<LLMResponse> => {
       };
     }
 
-    // 2. Busca normal
+    // 3. Busca normal
     const searchTerm = message.toLowerCase()
       .replace(/[?.,!]/g, '')
       .replace(/o que é|what is|que es|como usar|how to use/g, '')
       .trim();
 
-    // Busca dinâmica pelo termo em qualquer categoria
+    // 4. Busca dinâmica pelo termo
     const knowledge = await Knowledge.findOne({
       term: searchTerm
     }).sort({ timestamp: -1 });
 
     if (knowledge) {
-      // Formata resposta baseada no tipo
       return {
         content: formatResponse(knowledge),
         confidence: knowledge.confidence || 0.8
@@ -472,6 +491,7 @@ const generateResponse = async (message: string): Promise<LLMResponse> => {
       content: `Não encontrei uma definição para "${searchTerm}". Você pode me ensinar usando 'aprenda "definição"'`,
       confidence: 0
     };
+
   } catch (error) {
     console.error('❌ Erro:', error);
     return {
