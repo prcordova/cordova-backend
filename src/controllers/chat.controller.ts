@@ -2,6 +2,8 @@ import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { Knowledge } from '../models/Knowledge.model';
 import { baseKnowledge as initialKnowledge } from '../knowledge';
 import { learnFromGoogle, findKnowledge } from './knowledge.controller';
+import { franc } from 'franc'; // Para detectar idioma
+import { translate } from '@vitalets/google-translate-api'; // Para tradução
 
 // Interface para definições base
 interface Definition {
@@ -233,31 +235,7 @@ enum QuestionCategory {
   GENERAL = 'general'
 }
 
-// Funções auxiliares
-const extractTopics = (message: string): string[] => {
-  // Remove pontuação e palavras comuns
-  const cleanMessage = message
-    .toLowerCase()
-    .replace(/[?.,!]/g, '')
-    .replace(/o que é|como|usar|me explique|sobre/g, '')
-    .trim();
-
-  // Identifica tags HTML
-  const tagMatch = cleanMessage.match(/<(\w+)>|(?:tag|elemento)\s+(\w+)/i);
-  if (tagMatch) {
-    return [tagMatch[1] || tagMatch[2]];
-  }
-
-  // Procura termos HTML conhecidos
-  const htmlTerms = ['html', 'head', 'body', 'div', 'span', 'p', 'a', 'img'];
-  const words = cleanMessage.split(' ');
-  const topics = words.filter(word => 
-    htmlTerms.includes(word) || 
-    word.length > 2
-  );
-
-  return topics;
-};
+ 
 
 const detectQuestionType = (message: string): string => {
   if (message.match(/o que|qual|defina|explique/i)) return 'definition';
@@ -395,62 +373,156 @@ interface LLMResponse {
   source?: string;
 }
 
-const generateResponse = async (message: string): Promise<LLMResponse> => {
-  console.log('📝 Processando mensagem:', message);
+interface TranslationMap {
+  [key: string]: {
+    [key: string]: string;
+  };
+}
 
+ 
+interface DictionaryResponse {
+  word: string;
+  meanings: string[];
+  language: string;
+  source: string;
+}
+
+const searchDictionaries = async (term: string, lang: string): Promise<DictionaryResponse | null> => {
   try {
-    // 1. Verifica cálculos primeiro
-    const mathPattern = /(\d+\s*[\+\-\*\/]\s*\d+)/;
-    const mathMatch = message.match(mathPattern);
-    if (mathMatch) {
-      const expression = mathMatch[1];
-      const cleanExpr = expression.replace(/\s+/g, '');
-      try {
-        const result = eval(cleanExpr);
-        if (Number.isFinite(result)) {
-          return {
-            content: `${cleanExpr} = ${result}`,
-            confidence: 1
-          };
-        }
-      } catch (error) {
-        console.error('❌ Erro no cálculo:', error);
+    const cached = await Knowledge.findOne({
+      term: term.toLowerCase(),
+      language: lang,
+      type: 'dictionary'
+    });
+
+    if (cached) {
+      return {
+        word: cached.term,
+        meanings: [cached.content],
+        language: cached.language,
+        source: cached.source
+      };
+    }
+
+    return null;
+  } catch (error) {
+    console.error('❌ Erro na busca em dicionários:', error);
+    return null;
+  }
+};
+
+const generateResponse = async (message: string): Promise<LLMResponse> => {
+  try {
+    // 1. Verifica se é um comando de aprendizado
+    if (message.toLowerCase().startsWith('aprenda')) {
+      const content = message
+        .replace(/^aprenda\s*["'](.*)["'].*$/i, '$1')
+        .trim();
+
+      // Analisa o conteúdo para determinar o tipo
+      const contentType = analyzeContentType(content);
+      const term = extractTerm(content, contentType);
+
+      if (!term) {
+        return {
+          content: 'Não consegui identificar o termo. Pode ser mais específico?',
+          confidence: 0
+        };
       }
+
+      // Salva o conhecimento de forma dinâmica
+      await Knowledge.create({
+        content,
+        type: contentType.type,
+        category: contentType.category,
+        source: 'user_teaching',
+        path: `${contentType.category}/${contentType.type}`,
+        language: 'pt',
+        term: term.toLowerCase(),
+        confidence: 1,
+        timestamp: new Date()
+      });
+
+      return {
+        content: `Obrigado! Aprendi sobre ${term} na categoria ${contentType.category}.`,
+        confidence: 1
+      };
     }
 
-    // 2. Busca ampla inicial
-    const searchTerm = message.toLowerCase().trim();
-    const results = await Knowledge.find({
-      content: { $regex: searchTerm, $options: 'i' }
-    }).limit(10);
+    // 2. Busca normal
+    const searchTerm = message.toLowerCase()
+      .replace(/[?.,!]/g, '')
+      .replace(/o que é|what is|que es|como usar|how to use/g, '')
+      .trim();
 
-    // 3. Valida e remove redundâncias
-    const uniqueResults = removeDuplicateContent(results);
+    // Busca dinâmica pelo termo em qualquer categoria
+    const knowledge = await Knowledge.findOne({
+      term: searchTerm
+    }).sort({ timestamp: -1 });
 
-    // 4. Analisa utilidade do conteúdo
-    const validatedResults = validateContentUtility(uniqueResults, searchTerm);
-
-    // 5. Se não encontrou nada útil, tenta busca alternativa
-    if (validatedResults.length === 0) {
-      console.log('🔄 Tentando busca alternativa...');
-      const alternativeResults = await Knowledge.find({
-        $or: [
-          { term: { $regex: searchTerm, $options: 'i' } },
-          { content: { $regex: `define.*${searchTerm}|${searchTerm}.*means`, $options: 'i' } }
-        ]
-      }).limit(5);
-
-      return processResults(alternativeResults, searchTerm);
+    if (knowledge) {
+      // Formata resposta baseada no tipo
+      return {
+        content: formatResponse(knowledge),
+        confidence: knowledge.confidence || 0.8
+      };
     }
 
-    return processResults(validatedResults, searchTerm);
-
+    return {
+      content: `Não encontrei uma definição para "${searchTerm}". Você pode me ensinar usando 'aprenda "definição"'`,
+      confidence: 0
+    };
   } catch (error) {
     console.error('❌ Erro:', error);
     return {
       content: "Ocorreu um erro ao processar sua pergunta.",
       confidence: 0
     };
+  }
+};
+
+const analyzeContentType = (content: string) => {
+  // Detecta padrões no conteúdo
+  if (content.match(/<[^>]+>|tag|html|css/i)) {
+    return { type: 'element', category: 'html' };
+  }
+  if (content.match(/presidente|governo|política|ministro/i)) {
+    return { type: 'concept', category: 'politics' };
+  }
+  if (content.match(/\d+\s*[\+\-\*\/]\s*\d+/)) {
+    return { type: 'operation', category: 'math' };
+  }
+  if (content.match(/capital|país|cidade|estado/i)) {
+    return { type: 'location', category: 'geography' };
+  }
+  // Categoria padrão para outros tipos de conteúdo
+  return { type: 'concept', category: 'general' };
+};
+
+const extractTerm = (content: string, contentType: { type: string, category: string }) => {
+  switch (contentType.category) {
+    case 'html':
+      return content.match(/<(\w+)[^>]*>|(?:tag|elemento)\s+(\w+)/i)?.[1] || null;
+    case 'politics':
+      return content.match(/(?:sobre|presidente|política)\s+(\w+)/i)?.[1] || null;
+    case 'geography':
+      return content.match(/(?:capital|país|cidade)\s+(\w+)/i)?.[1] || null;
+    default:
+      // Extrai o primeiro substantivo relevante
+      return content.split(/\s+/)[0];
+  }
+};
+
+const formatResponse = (knowledge: any) => {
+  switch (knowledge.category) {
+    case 'html':
+      return `A tag <${knowledge.term}> é ${knowledge.content}`;
+    case 'politics':
+      return `${knowledge.term}: ${knowledge.content}`;
+    case 'geography':
+      return `${knowledge.term} é ${knowledge.content}`;
+    default:
+      return knowledge.content;
   }
 };
 
@@ -468,7 +540,7 @@ const removeDuplicateContent = (results: any[]): any[] => {
   });
 };
 
-const validateContentUtility = (results: any[], term: string): any[] => {
+const validateContentUtility = (results: any[]): any[] => {
   return results.filter(item => {
     const content = item.content.toLowerCase();
     
@@ -481,31 +553,6 @@ const validateContentUtility = (results: any[], term: string): any[] => {
 
     return (hasDefinition || hasTechnicalContext) && !hasNoiseWords && !isTooShort && !isTooLong;
   });
-};
-
-const processResults = (results: any[], term: string): LLMResponse => {
-  if (results.length === 0) {
-    return {
-      content: `Não encontrei uma definição útil para "${term}". Você poderia me ensinar?`,
-      confidence: 0
-    };
-  }
-
-  // Pega o melhor resultado
-  const bestResult = results[0];
-  const cleanContent = cleanAndExtractDefinition(bestResult.content, term);
-
-  if (cleanContent) {
-    return {
-      content: cleanContent,
-      confidence: 0.8
-    };
-  }
-
-  return {
-    content: `Encontrei informações sobre "${term}", mas não consegui extrair uma definição clara. Pode reformular a pergunta?`,
-    confidence: 0.3
-  };
 };
 
 const cleanAndExtractDefinition = (content: string, term: string): string => {
