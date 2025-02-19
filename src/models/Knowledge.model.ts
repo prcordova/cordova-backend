@@ -1,44 +1,27 @@
-import mongoose, { Schema } from 'mongoose';
+import mongoose, { Schema, model } from 'mongoose';
 
-export enum KnowledgeType {
-  MATH = 'math',
-  GEOGRAPHY = 'geography',
-  POLITICS = 'politics',
-  HISTORY = 'history',
-  SCIENCE = 'science',
-  GENERAL = 'general'
+interface IKnowledge {
+  content: string;
+  category?: string;
+  tokens?: string[];
+  source: string;
+  path: string;
+  timestamp: Date;
+  embeddings?: number[];
 }
 
-const KnowledgeSchema = new Schema({
-  content: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  source: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  type: {
-    type: String,
-    enum: Object.values(KnowledgeType),
-    default: KnowledgeType.GENERAL
-  },
-  timestamp: {
-    type: Date,
-    default: Date.now
-  },
-  embeddings: {
-    type: [Number],
-    default: []
-  }
-}, {
-  timestamps: true
+const KnowledgeSchema = new Schema<IKnowledge>({
+  content: { type: String, required: true },
+  category: { type: String },
+  tokens: [String],
+  source: { type: String, required: true },
+  path: { type: String, required: true },
+  timestamp: { type: Date, default: Date.now },
+  embeddings: [Number]
 });
 
 KnowledgeSchema.index({ content: 'text' });
 KnowledgeSchema.index({ source: 1 });
-KnowledgeSchema.index({ type: 1 });
+KnowledgeSchema.index({ path: 1 });
 
-export const Knowledge = mongoose.model('Knowledge', KnowledgeSchema);
+export const Knowledge = model<IKnowledge>('Knowledge', KnowledgeSchema);

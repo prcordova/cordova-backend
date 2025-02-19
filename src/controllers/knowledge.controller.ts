@@ -3,8 +3,6 @@ import { Knowledge } from '../models/Knowledge.model';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pdf from 'pdf-parse';
-import { detectKnowledgeType } from './chat.controller';
-import puppeteer from 'puppeteer';
 
 // Interface para a resposta do Bing
 interface BingResponse {
@@ -76,7 +74,7 @@ export const learnFromGoogle = async (query: string) => {
           await Knowledge.create({
             content,
             source: 'bing_search',
-            type: detectKnowledgeType(query)
+            type: 'general'
           });
         }
       }
@@ -98,61 +96,12 @@ export const learnFromGoogle = async (query: string) => {
 
 export const learnFromMessage = async (message: string) => {
   try {
-    console.log('📝 Aprendendo:', message.substring(0, 100) + '...');
+    console.log('📝 Aprendendo:', message);
     
-    // Tamanho máximo de cada chunk (aproximadamente 50KB)
-    const CHUNK_SIZE = 50000;
-    
-    // Se a mensagem for muito longa, dividir em partes
-    if (message.length > CHUNK_SIZE) {
-      console.log(`📚 Mensagem grande detectada (${message.length} caracteres). Dividindo em partes...`);
+    if (message.includes('=')) {
+      const [expression, result] = message.split('=').map(s => s.trim());
       
-      // Dividir por parágrafos ou seções se possível
-      const sections = message.split(/\n\s*\n/); // Divide por linhas em branco
-      let currentChunk = '';
-      let chunks = [];
-      
-      for (const section of sections) {
-        // Se adicionar esta seção exceder o tamanho máximo
-        if ((currentChunk + section).length > CHUNK_SIZE && currentChunk.length > 0) {
-          chunks.push(currentChunk.trim());
-          currentChunk = section;
-        } else {
-          currentChunk += (currentChunk ? '\n\n' : '') + section;
-        }
-      }
-      
-      // Adicionar o último chunk se houver
-      if (currentChunk.trim()) {
-        chunks.push(currentChunk.trim());
-      }
-      
-      console.log(`🔄 Processando ${chunks.length} partes...`);
-      
-      // Processar cada chunk
-      for (let i = 0; i < chunks.length; i++) {
-        console.log(`📖 Processando parte ${i + 1}/${chunks.length}`);
-        await processChunk(chunks[i]);
-      }
-      
-      return `Aprendizado concluído! Processadas ${chunks.length} partes do texto.`;
-    }
-    
-    // Se a mensagem for pequena, processar normalmente
-    return await processChunk(message);
-  } catch (error) {
-    console.error('❌ Erro ao aprender:', error);
-    throw error;
-  }
-};
-
-// Função auxiliar para processar cada chunk
-const processChunk = async (chunk: string) => {
-  try {
-    // Se for uma expressão matemática
-    if (chunk.includes('=')) {
-      const [expression, result] = chunk.split('=').map(s => s.trim());
-      
+      // Função para calcular expressão
       const calculateExpression = (expr: string): number => {
         const numbers = expr.split(/[\+\-\*x\/]/).map(Number);
         const operators = expr.match(/[\+\-\*x\/]/g) || [];
@@ -173,6 +122,7 @@ const processChunk = async (chunk: string) => {
         return result;
       };
 
+      // Valida se é uma expressão matemática
       if (/^\d+(\s*[\+\-\*x\/]\s*\d+)*$/.test(expression)) {
         const calculatedResult = calculateExpression(expression);
         
